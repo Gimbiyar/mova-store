@@ -53,8 +53,14 @@ jobs:
       - name: Run ESLint
         run: npm run lint
 
+      - name: Check code formatting
+        run: npm run format:check
+
       - name: Type check
         run: npm run type-check
+
+      - name: Type check tests
+        run: npm run type-check:tests
 
       # "vitest run --coverage" executes the whole suite once and collects v8
       # coverage in the same pass, so a separate "npm run test" step would run
@@ -106,7 +112,6 @@ jobs:
 
       - name: Enforce test file naming convention
         run: node scripts/check-test-names.mjs
-
   # Soroban contract checks
   contracts:
     name: Soroban Contracts (Build, Test, Format, Clippy)
