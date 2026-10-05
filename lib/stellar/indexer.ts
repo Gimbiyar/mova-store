@@ -1,4 +1,4 @@
-import { rpc, xdr } from "@stellar/stellar-sdk";
+import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 
 import {
   CHECKOUT_CONTRACT_ID,
@@ -100,6 +100,9 @@ export class PaymentEventIndexer {
   ) {
     this.server = new rpc.Server(opts.rpcUrl ?? RPC_URL);
     this.contractId = opts.contractId ?? CHECKOUT_CONTRACT_ID;
+    if (!this.contractId || !StrKey.isValidContract(this.contractId)) {
+      throw new Error(`Invalid or missing checkout contract ID: "${this.contractId || ""}"`);
+    }
     this.pollMs = opts.pollMs ?? EVENT_POLL_INTERVAL_MS;
     this.watchedSymbols = opts.watchedSymbols ?? ["pay", "create_order", "dispatch", "refund"];
     this.durableStartLedger =
@@ -341,7 +344,13 @@ export class PaymentEventIndexer {
   }
 
   private async fetchEvents(): Promise<rpc.Api.GetEventsResponse> {
-    const filters: rpc.Api.EventFilter[] = [{ type: "contract", contractIds: [this.contractId] }];
+    const filters: rpc.Api.EventFilter[] = [
+      {
+        type: "contract",
+        contractIds: [this.contractId],
+        topics: this.topicFilters(),
+      },
+    ];
     if (this.startLedger !== undefined) {
       return this.server.getEvents({ filters, startLedger: this.startLedger });
     }
@@ -352,6 +361,15 @@ export class PaymentEventIndexer {
   }
 
   /**
+   * One topic filter per watched symbol, matching `topics[0]` (the event name)
+   * at the RPC so unwatched events are never transferred or decoded. The RPC
+   * ORs the per-symbol filters and each segment is a base64-encoded `ScVal`.
+   */
+  private topicFilters(): string[][] {
+    return this.watchedSymbols.map((symbol) => [xdr.ScVal.scvSymbol(symbol).toXDR("base64")]);
+  }
+
+  /**
    * Keep the scan recoverable. A start ledger that predates the RPC's
    * retention window is rolled forward toward the tip. A persisted cursor can
    * outlive retention for the same reason, so on a retention error it is
@@ -359,6 +377,13 @@ export class PaymentEventIndexer {
    * stuck on a stale resume point.
    */
   private recoverFromRetentionError(error?: unknown): void {
+    // A transient failure - a timeout, a 5xx, a dropped connection - says
+    // nothing about where the scan should resume. Moving the window on any
+    // error skips every event between the old and the new position, so only a
+    // retention error, where the requested position has genuinely aged out of
+    // the RPC's history, may move it. Everything else retries the same window.
+    if (!isRetentionError(error)) return;
+
     if (this.startLedger !== undefined && this.latestLedger !== undefined) {
       this.startLedger = Math.max(
         this.startLedger,
@@ -367,7 +392,9 @@ export class PaymentEventIndexer {
       return;
     }
 
-    if (this.cursor !== undefined && isRetentionError(error)) {
+    // The retention check above already ran, so reaching this point means the
+    // cursor really has outlived the RPC's history.
+    if (this.cursor !== undefined) {
       this.cursor = undefined;
       this.clearPersistedCursor();
       this.startLedger = this.resolveStartLedger();
